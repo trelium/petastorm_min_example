@@ -32,15 +32,21 @@ from examples.mnist import DEFAULT_MNIST_DATA_PATH
 from petastorm import make_reader, TransformSpec
 from petastorm.pytorch import DataLoader
 
+import pytorch_lightning as pl
+from torchmetrics import Accuracy
 
-class Net(nn.Module):
-    def __init__(self):
+
+class Net(pl.LightningModule):
+    def __init__(self, momentum, lr):
         super(Net, self).__init__()
         self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
         self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
         self.conv2_drop = nn.Dropout2d()
         self.fc1 = nn.Linear(320, 50)
         self.fc2 = nn.Linear(50, 10)
+
+        self.momentum = momentum
+        self.lr = lr
 
     # pylint: disable=arguments-differ
     def forward(self, x):
@@ -52,8 +58,100 @@ class Net(nn.Module):
         x = self.fc2(x)
         return F.log_softmax(x, dim=1)
 
+    def training_step(self, batch, batch_idx):
+        data, target = batch['image'], batch['digit']
+        loss = F.nll_loss(self(data), target)
+        return loss
 
-def train(model, device, train_loader, log_interval, optimizer, epoch):
+    def validation_step(self, batch, batch_idx):
+        data, target = batch['image'], batch['digit']
+        output = self(data)
+        loss = F.nll_loss(output, target, reduction='sum')  # sum up batch loss
+        preds = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
+        self.accuracy(preds, target)
+        return loss
+
+    def configure_optimizers(self):
+            return optim.SGD(self.parameters(), lr=self.lr, momentum=self.momentum)
+
+
+def _transform_row(mnist_row):
+    # For this example, the images are stored as simpler ndarray (28,28), but the
+    # training network expects 3-dim images, hence the additional lambda transform.
+    transform = transforms.Compose([
+        transforms.Lambda(lambda nd: nd.reshape(28, 28, 1)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+    # In addition, the petastorm pytorch DataLoader does not distinguish the notion of
+    # data or target transform, but that actually gives the user more flexibility
+    # to make the desired partial transform, as shown here.
+    result_row = {
+        'image': transform(mnist_row['image']),
+        'digit': mnist_row['digit']
+    }
+
+    return result_row
+
+def main():
+
+     # Training settings
+    parser = argparse.ArgumentParser(description='Petastorm MNIST Example')
+    default_dataset_url = 'file://{}'.format(DEFAULT_MNIST_DATA_PATH)
+    parser.add_argument('--dataset-url', type=str,
+                        default=default_dataset_url, metavar='S',
+                        help='hdfs:// or file:/// URL to the MNIST petastorm dataset '
+                             '(default: %s)' % default_dataset_url)
+    parser.add_argument('--batch-size', type=int, default=64, metavar='N',
+                        help='input batch size for training (default: 64)')
+    parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
+                        help='input batch size for testing (default: 1000)')
+    parser.add_argument('--epochs', type=int, default=10, metavar='N',
+                        help='number of epochs to train (default: 10)')
+    parser.add_argument('--do_eval', action='store_true', default=False,
+                        help='perform validation step while training?')
+    parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
+                        help='learning rate (default: 0.01)')
+    parser.add_argument('--momentum', type=float, default=0.5, metavar='M',
+                        help='SGD momentum (default: 0.5)')
+    parser.add_argument('--gpus', action='store_true', default=True,
+                        help='Number of GPUs to train on (int) or which GPUs to train on (list or str) applied per node')
+    parser.add_argument('--seed', type=int, default=1, metavar='S',
+                        help='random seed (default: 1)')
+    args = parser.parse_args()
+
+
+    torch.manual_seed(args.seed)
+    model =  Net(lr=args.lr, momentum=args.momentum)
+    transform = TransformSpec(_transform_row, removed_fields=['idx'])
+
+
+    if args.do_eval:
+        trainer = pl.Trainer(check_val_every_n_epoch=1, gpus = args.gpus)
+        with DataLoader(make_reader('{}/train'.format(args.dataset_url), num_epochs=args.epochs,
+                                transform_spec=transform),
+                                batch_size=args.batch_size) as train_dataset:
+            with DataLoader(make_reader('{}/test'.format(args.dataset_url), num_epochs=args.epochs,
+                                    transform_spec=transform),
+                                    batch_size=args.test_batch_size) as eval_dataset:
+                trainer.fit(model,train_dataset,eval_dataset)
+    else:
+        trainer = pl.Trainer(check_val_every_n_epoch=0)
+        with DataLoader(make_reader('{}/train'.format(args.dataset_url), num_epochs=args.epochs,
+                                transform_spec=transform),
+                                batch_size=args.batch_size) as train_dataset:
+                trainer.fit(model, train_dataset, DataLoader([["dummy"]]))
+
+if __name__ == '__main__':
+    main()
+
+
+
+"""
+
+
+
+def training_step(train_loader, log_interval, optimizer, epoch):
     model.train()
     for batch_idx, row in enumerate(train_loader):
         data, target = row['image'].to(device), row['digit'].to(device)
@@ -65,7 +163,6 @@ def train(model, device, train_loader, log_interval, optimizer, epoch):
         if batch_idx % log_interval == 0:
             print('Train Epoch: {} [{}]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), loss.item()))
-
 
 def test(model, device, test_loader):
     model.eval()
@@ -86,23 +183,6 @@ def test(model, device, test_loader):
         test_loss, correct, count, 100. * correct / count))
 
 
-def _transform_row(mnist_row):
-    # For this example, the images are stored as simpler ndarray (28,28), but the
-    # training network expects 3-dim images, hence the additional lambda transform.
-    transform = transforms.Compose([
-        transforms.Lambda(lambda nd: nd.reshape(28, 28, 1)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
-    # In addition, the petastorm pytorch DataLoader does not distinguish the notion of
-    # data or target transform, but that actually gives the user more flexibility
-    # to make the desired partial transform, as shown here.
-    result_row = {
-        'image': transform(mnist_row['image']),
-        'digit': mnist_row['digit']
-    }
-
-    return result_row
 
 
 def main():
@@ -166,6 +246,4 @@ def main():
                         batch_size=args.test_batch_size) as test_loader:
             test(model, device, test_loader)
 
-
-if __name__ == '__main__':
-    main()
+"""
