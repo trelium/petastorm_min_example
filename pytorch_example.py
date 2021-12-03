@@ -33,7 +33,9 @@ from petastorm import make_reader, TransformSpec
 from petastorm.pytorch import DataLoader
 
 import pytorch_lightning as pl
-from torchmetrics import Accuracy
+from torchmetrics import Accuracy, Metric
+from typing import Dict, Any, Union, List, Optional, Union, Callable, AnyStr
+
 
 class Support(Metric):
     def __init__(self,  n_classes: int = 10,
@@ -92,9 +94,9 @@ class Net(pl.LightningModule):
         data, target = batch['image'], batch['digit']
         output = self(data)
         loss = F.nll_loss(output, target, reduction='sum')  # sum up batch loss
-        preds = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
-        self.accuracy(preds, target)
-        self.support.update(target = batch['digit'])
+        #preds = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
+        #self.accuracy(preds, target)
+        self.support.update(_preds= output, target = batch['digit'])
         return loss
 
     def configure_optimizers(self):
@@ -134,13 +136,13 @@ def main():
                         help='input batch size for testing (default: 1000)')
     parser.add_argument('--epochs', type=int, default=10, metavar='N',
                         help='number of epochs to train (default: 10)')
-    parser.add_argument('--do_eval', action='store_true', default=False,
+    parser.add_argument('--do_eval', action='store_true', default=True,
                         help='perform validation step while training?')
     parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
                         help='learning rate (default: 0.01)')
     parser.add_argument('--momentum', type=float, default=0.5, metavar='M',
                         help='SGD momentum (default: 0.5)')
-    parser.add_argument('--gpus', action='store_true', default=True,
+    parser.add_argument('--gpus', default=1, #TODO need to debug multi-gpu
                         help='Number of GPUs to train on (int) or which GPUs to train on (list or str) applied per node')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
@@ -162,7 +164,7 @@ def main():
                                     batch_size=args.test_batch_size) as eval_dataset:
                 trainer.fit(model,train_dataset,eval_dataset)
     else:
-        trainer = pl.Trainer(check_val_every_n_epoch=0)
+        trainer = pl.Trainer(check_val_every_n_epoch=0,  gpus = args.gpus)
         with DataLoader(make_reader('{}/train'.format(args.dataset_url), num_epochs=args.epochs,
                                 transform_spec=transform),
                                 batch_size=args.batch_size) as train_dataset:
