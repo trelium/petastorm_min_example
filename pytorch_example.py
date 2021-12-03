@@ -35,6 +35,28 @@ from petastorm.pytorch import DataLoader
 import pytorch_lightning as pl
 from torchmetrics import Accuracy
 
+class Support(Metric):
+    def __init__(self,  n_classes: int = 10,
+                        compute_on_step: bool = True,
+                        dist_sync_on_step: bool = False,
+                        process_group: Optional[Any] = None,
+                        dist_sync_fn: Callable = None) -> None:
+
+        super().__init__(compute_on_step=compute_on_step,
+                        dist_sync_on_step=dist_sync_on_step,
+                        process_group=process_group,
+                        dist_sync_fn=dist_sync_fn)
+
+        self.n_classes = n_classes
+        self.add_state("counts", default = torch.zeros(self.n_classes),
+                                dist_reduce_fx="sum")
+
+    def update(self, _preds: torch.Tensor, target: torch.Tensor) -> None:
+        values = torch.bincount(target, minlength=self.n_classes)
+        self.counts += values
+
+    def compute(self) -> Dict[AnyStr,torch.Tensor]:
+        return {i:self.counts[i] for i in range(self.n_classes)}
 
 class Net(pl.LightningModule):
     def __init__(self, momentum, lr):
@@ -47,6 +69,9 @@ class Net(pl.LightningModule):
 
         self.momentum = momentum
         self.lr = lr
+
+        self.accuracy = Accuracy()
+        self.support = Support()
 
     # pylint: disable=arguments-differ
     def forward(self, x):
@@ -69,6 +94,7 @@ class Net(pl.LightningModule):
         loss = F.nll_loss(output, target, reduction='sum')  # sum up batch loss
         preds = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
         self.accuracy(preds, target)
+        self.support.update(target = batch['digit'])
         return loss
 
     def configure_optimizers(self):
