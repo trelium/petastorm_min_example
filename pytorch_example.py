@@ -95,7 +95,7 @@ class Net(pl.LightningModule):
         output = self(data)
         loss = F.nll_loss(output, target, reduction='sum')  # sum up batch loss
         #preds = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
-        #self.accuracy(preds, target)
+        #self.accuracy(preds, target)   #TODO fix dimensions 
         self.support.update(_preds= output, target = batch['digit'])
         return loss
 
