@@ -62,28 +62,6 @@ class Support(Metric):
     def compute(self) -> Dict[AnyStr,torch.Tensor]:
         return {str(i):self.counts[i].item() for i in range(self.n_classes)} #TODO does str work here?
 
-class SeenExamples(Metric):
-    def __init__(self, compute_on_step: bool = True,
-                        dist_sync_on_step: bool = False,
-                        process_group: Optional[Any] = None,
-                        dist_sync_fn: Callable = None) -> None:
-
-        super().__init__(compute_on_step=compute_on_step,
-                        dist_sync_on_step=dist_sync_on_step,
-                        process_group=process_group,
-                        dist_sync_fn=dist_sync_fn)
-        
-        self.add_state("counts", default = torch.zeros(1))
-        self.counts = torch.zeros(1)
-
-    def update(self, _preds: torch.Tensor, target: torch.Tensor) -> None:
-        values = torch.tensor(target.shape).to('cuda:0')
-
-        torch.cat((self.counts, values))
-
-    def compute(self) -> Dict[AnyStr,torch.Tensor]:
-        return torch.sum(self.counts)
-
 class Net(pl.LightningModule):
     def __init__(self, momentum, lr):
         super(Net, self).__init__()
@@ -96,12 +74,9 @@ class Net(pl.LightningModule):
         self.momentum = momentum
         self.lr = lr
 
-        self.accuracy = Accuracy()
         self.support_val = Support()
         self.support_tr = Support()
 
-        self.examples_tr = SeenExamples()
-        self.examples_val = SeenExamples()
 
     # pylint: disable=arguments-differ
     def forward(self, x):
@@ -121,36 +96,25 @@ class Net(pl.LightningModule):
         output = self(data)
         self.support_tr.update(_preds= output, target = batch['digit'])
 
-        self.examples_tr.update(_preds= output, target = batch['digit'])
-
         return loss
 
     def on_train_epoch_end(self, unused: Optional = None) -> None:
         print('\n Training class frequencies: \n', self.support_tr.compute())
         self.support_tr.reset()
-        exampl = self.examples_tr.compute()
-        self.log('examples_train', exampl)
-        self.examples_tr.reset()
 
 
     def validation_step(self, batch, batch_idx):
         data, target = batch['image'], batch['digit']
         output = self(data)
         loss = F.nll_loss(output, target, reduction='sum')  # sum up batch loss
-        #preds = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
-        #self.accuracy(preds, target)   #TODO fix dimensions 
         self.support_val.update(_preds= output, target = batch['digit'])
         #self.log('support', self.support_val, on_step = False, on_epoch = True)
-        self.examples_val.update(_preds= output, target = batch['digit'])
 
         return loss
 
     def on_validation_epoch_end(self) -> None:
         print('\n Validation class frequencies: \n', self.support_val.compute())
         self.support_val.reset()
-        exampl = self.examples_val.compute()
-        self.log('examples_val', exampl)
-        self.examples_val.reset()
 
 
     def configure_optimizers(self):
