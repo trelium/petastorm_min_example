@@ -35,6 +35,8 @@ from petastorm.pytorch import DataLoader
 import pytorch_lightning as pl
 from torchmetrics import Accuracy, Metric
 from typing import Dict, Any, Union, List, Optional, Union, Callable, AnyStr
+from pytorch_lightning.loggers import TensorBoardLogger
+
 
 
 class Support(Metric):
@@ -58,7 +60,29 @@ class Support(Metric):
         self.counts += values
 
     def compute(self) -> Dict[AnyStr,torch.Tensor]:
-        return {i:self.counts[i] for i in range(self.n_classes)}
+        return {str(i):self.counts[i].item() for i in range(self.n_classes)} #TODO does str work here?
+
+class SeenExamples(Metric):
+    def __init__(self, compute_on_step: bool = True,
+                        dist_sync_on_step: bool = False,
+                        process_group: Optional[Any] = None,
+                        dist_sync_fn: Callable = None) -> None:
+
+        super().__init__(compute_on_step=compute_on_step,
+                        dist_sync_on_step=dist_sync_on_step,
+                        process_group=process_group,
+                        dist_sync_fn=dist_sync_fn)
+        
+        self.add_state("counts", default = torch.zeros(1))
+        self.counts = torch.zeros(1)
+
+    def update(self, _preds: torch.Tensor, target: torch.Tensor) -> None:
+        values = torch.tensor(target.shape).to('cuda:0')
+
+        torch.cat((self.counts, values))
+
+    def compute(self) -> Dict[AnyStr,torch.Tensor]:
+        return torch.sum(self.counts)
 
 class Net(pl.LightningModule):
     def __init__(self, momentum, lr):
@@ -73,7 +97,11 @@ class Net(pl.LightningModule):
         self.lr = lr
 
         self.accuracy = Accuracy()
-        self.support = Support()
+        self.support_val = Support()
+        self.support_tr = Support()
+
+        self.examples_tr = SeenExamples()
+        self.examples_val = SeenExamples()
 
     # pylint: disable=arguments-differ
     def forward(self, x):
@@ -88,7 +116,22 @@ class Net(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         data, target = batch['image'], batch['digit']
         loss = F.nll_loss(self(data), target)
+        self.log('loss_train', loss)
+
+        output = self(data)
+        self.support_tr.update(_preds= output, target = batch['digit'])
+
+        self.examples_tr.update(_preds= output, target = batch['digit'])
+
         return loss
+
+    def on_train_epoch_end(self, unused: Optional = None) -> None:
+        print('\n Training class frequencies: \n', self.support_tr.compute())
+        self.support_tr.reset()
+        exampl = self.examples_tr.compute()
+        self.log('examples_train', exampl)
+        self.examples_tr.reset()
+
 
     def validation_step(self, batch, batch_idx):
         data, target = batch['image'], batch['digit']
@@ -96,11 +139,22 @@ class Net(pl.LightningModule):
         loss = F.nll_loss(output, target, reduction='sum')  # sum up batch loss
         #preds = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
         #self.accuracy(preds, target)   #TODO fix dimensions 
-        self.support.update(_preds= output, target = batch['digit'])
+        self.support_val.update(_preds= output, target = batch['digit'])
+        #self.log('support', self.support_val, on_step = False, on_epoch = True)
+        self.examples_val.update(_preds= output, target = batch['digit'])
+
         return loss
 
+    def on_validation_epoch_end(self) -> None:
+        print('\n Validation class frequencies: \n', self.support_val.compute())
+        self.support_val.reset()
+        exampl = self.examples_val.compute()
+        self.log('examples_val', exampl)
+        self.examples_val.reset()
+
+
     def configure_optimizers(self):
-            return optim.SGD(self.parameters(), lr=self.lr, momentum=self.momentum)
+        return optim.SGD(self.parameters(), lr=self.lr, momentum=self.momentum)
 
 
 def _transform_row(mnist_row):
@@ -134,10 +188,10 @@ def main():
                         help='input batch size for training (default: 64)')
     parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
                         help='input batch size for testing (default: 1000)')
-    parser.add_argument('--epochs', type=int, default=10, metavar='N',
-                        help='number of epochs to train (default: 10)')
+    parser.add_argument('--epochs', type=int, default=3, metavar='N',
+                        help='number of epochs to train (default: 3)')
     parser.add_argument('--do_eval', action='store_true', default=True,
-                        help='perform validation step while training?')
+                        help='perform validation step after each training step?')
     parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
                         help='learning rate (default: 0.01)')
     parser.add_argument('--momentum', type=float, default=0.5, metavar='M',
@@ -151,127 +205,30 @@ def main():
 
     torch.manual_seed(args.seed)
     model =  Net(lr=args.lr, momentum=args.momentum)
+    logger = TensorBoardLogger("tb_logs", name="my_model")
     transform = TransformSpec(_transform_row, removed_fields=['idx'])
 
 
     if args.do_eval:
-        trainer = pl.Trainer(check_val_every_n_epoch=1, gpus = args.gpus)
-        with DataLoader(make_reader('{}/train'.format(args.dataset_url), num_epochs=args.epochs,
-                                transform_spec=transform),
-                                batch_size=args.batch_size) as train_dataset:
-            with DataLoader(make_reader('{}/test'.format(args.dataset_url), num_epochs=args.epochs,
+        trainer = pl.Trainer(check_val_every_n_epoch=1, gpus = args.gpus, num_sanity_val_steps=0, max_epochs = args.epochs, logger = logger) 
+        with DataLoader(make_reader('{}/train'.format(args.dataset_url), 
+                                    #num_epochs=args.epochs,
                                     transform_spec=transform),
-                                    batch_size=args.test_batch_size) as eval_dataset:
+                        batch_size=args.batch_size) as train_dataset:
+            with DataLoader(make_reader('{}/test'.format(args.dataset_url), 
+                                        #num_epochs=args.epochs,
+                                        transform_spec=transform),
+                            batch_size=args.test_batch_size) as eval_dataset:
                 trainer.fit(model,train_dataset,eval_dataset)
     else:
-        trainer = pl.Trainer(check_val_every_n_epoch=0,  gpus = args.gpus)
-        with DataLoader(make_reader('{}/train'.format(args.dataset_url), num_epochs=args.epochs,
-                                transform_spec=transform),
-                                batch_size=args.batch_size) as train_dataset:
+        trainer = pl.Trainer(check_val_every_n_epoch=0,  gpus = args.gpus, num_sanity_val_steps=0, max_epochs = args.epochs, logger = logger)
+        with DataLoader(make_reader('{}/train'.format(args.dataset_url), 
+                                    #num_epochs=args.epochs,
+                                    transform_spec=transform),
+                        batch_size=args.batch_size) as train_dataset:
                 trainer.fit(model, train_dataset, DataLoader([["dummy"]]))
 
 if __name__ == '__main__':
     main()
 
 
-
-"""
-
-
-
-def training_step(train_loader, log_interval, optimizer, epoch):
-    model.train()
-    for batch_idx, row in enumerate(train_loader):
-        data, target = row['image'].to(device), row['digit'].to(device)
-        optimizer.zero_grad()
-        output = model(data)
-        loss = F.nll_loss(output, target)
-        loss.backward()
-        optimizer.step()
-        if batch_idx % log_interval == 0:
-            print('Train Epoch: {} [{}]\tLoss: {:.6f}'.format(
-                epoch, batch_idx * len(data), loss.item()))
-
-def test(model, device, test_loader):
-    model.eval()
-    test_loss = 0
-    correct = 0
-    count = 0
-    with torch.no_grad():
-        for row in test_loader:
-            data, target = row['image'].to(device), row['digit'].to(device)
-            output = model(data)
-            test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
-            pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum().item()
-            count += data.shape[0]
-
-    test_loss /= count
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
-        test_loss, correct, count, 100. * correct / count))
-
-
-
-
-def main():
-    # Training settings
-    parser = argparse.ArgumentParser(description='Petastorm MNIST Example')
-    default_dataset_url = 'file://{}'.format(DEFAULT_MNIST_DATA_PATH)
-    parser.add_argument('--dataset-url', type=str,
-                        default=default_dataset_url, metavar='S',
-                        help='hdfs:// or file:/// URL to the MNIST petastorm dataset '
-                             '(default: %s)' % default_dataset_url)
-    parser.add_argument('--batch-size', type=int, default=64, metavar='N',
-                        help='input batch size for training (default: 64)')
-    parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
-                        help='input batch size for testing (default: 1000)')
-    parser.add_argument('--epochs', type=int, default=10, metavar='N',
-                        help='number of epochs to train (default: 10)')
-    parser.add_argument('--all-epochs', action='store_true', default=False,
-                        help='train all epochs before testing accuracy/loss')
-    parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
-                        help='learning rate (default: 0.01)')
-    parser.add_argument('--momentum', type=float, default=0.5, metavar='M',
-                        help='SGD momentum (default: 0.5)')
-    parser.add_argument('--no-cuda', action='store_true', default=False,
-                        help='disables CUDA training')
-    parser.add_argument('--seed', type=int, default=1, metavar='S',
-                        help='random seed (default: 1)')
-    parser.add_argument('--log-interval', type=int, default=10, metavar='N',
-                        help='how many batches to wait before logging training status')
-    args = parser.parse_args()
-    use_cuda = not args.no_cuda and torch.cuda.is_available()
-
-    torch.manual_seed(args.seed)
-
-    device = torch.device('cuda' if use_cuda else 'cpu')
-
-    model = Net().to(device)
-    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
-
-    # Configure loop and Reader epoch for illustrative purposes.
-    # Typical training usage would use the `all_epochs` approach.
-    #
-    if args.all_epochs:
-        # Run training across all the epochs before testing for accuracy
-        loop_epochs = 1
-        reader_epochs = args.epochs
-    else:
-        # Test training accuracy after each epoch
-        loop_epochs = args.epochs
-        reader_epochs = 1
-
-    transform = TransformSpec(_transform_row, removed_fields=['idx'])
-
-    # Instantiate each petastorm Reader with a single thread, shuffle enabled, and appropriate epoch setting
-    for epoch in range(1, loop_epochs + 1):
-        with DataLoader(make_reader('{}/train'.format(args.dataset_url), num_epochs=reader_epochs,
-                                    transform_spec=transform),
-                        batch_size=args.batch_size) as train_loader:
-            train(model, device, train_loader, args.log_interval, optimizer, epoch)
-        with DataLoader(make_reader('{}/test'.format(args.dataset_url), num_epochs=reader_epochs,
-                                    transform_spec=transform),
-                        batch_size=args.test_batch_size) as test_loader:
-            test(model, device, test_loader)
-
-"""

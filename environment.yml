@@ -17,7 +17,7 @@ dependencies:
   - cudatoolkit=10.2
   - pytorch-lightning=1.4.9
   - torchmetrics>=0.5
-  - tensorboardx
+  - tensorboard
   - pyspark=3.1.2
   - pip:
     - petastorm==0.11.3
