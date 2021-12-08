@@ -37,6 +37,12 @@ from torchmetrics import Accuracy, Metric
 from typing import Dict, Any, Union, List, Optional, Union, Callable, AnyStr
 from pytorch_lightning.loggers import TensorBoardLogger
 
+import torch.utils.data as d
+
+from torchvision.datasets import MNIST
+from torch.utils.data import Dataset
+
+from PIL import Image
 
 
 class Support(Metric):
@@ -139,6 +145,22 @@ def _transform_row(mnist_row):
 
     return result_row
 
+class TorchMNIST(MNIST):
+    def __getitem__(self, index: int):
+        """
+        Args:
+            index (int): Index
+        """
+        img, target = self.data[index], int(self.targets[index]) #img is Tensor
+
+        img = Image.fromarray(img.numpy(), mode="L")
+        
+        transform = transforms.Compose([
+                                        transforms.ToTensor(),
+                                        transforms.Normalize((0.1307,), (0.3081,))])
+        
+        return {'image': transform(img), 'digit':target}
+
 def main():
 
      # Training settings
@@ -156,6 +178,8 @@ def main():
                         help='number of epochs to train (default: 3)')
     parser.add_argument('--do_eval', action='store_true', default=True,
                         help='perform validation step after each training step?')
+    parser.add_argument('--use_torch_loader', action='store_false', default=True,
+                        help='Make use of the petastorm DataLoader in place of the pytorch DataLoader')
     parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
                         help='learning rate (default: 0.01)')
     parser.add_argument('--momentum', type=float, default=0.5, metavar='M',
@@ -172,25 +196,42 @@ def main():
     logger = TensorBoardLogger("tb_logs", name="my_model")
     transform = TransformSpec(_transform_row, removed_fields=['idx'])
 
-
-    if args.do_eval:
-        trainer = pl.Trainer(check_val_every_n_epoch=1, gpus = args.gpus, num_sanity_val_steps=0, max_epochs = args.epochs, logger = logger) 
-        with DataLoader(make_reader('{}/train'.format(args.dataset_url), 
-                                    #num_epochs=args.epochs,
-                                    transform_spec=transform),
-                        batch_size=args.batch_size) as train_dataset:
-            with DataLoader(make_reader('{}/test'.format(args.dataset_url), 
+    if args.use_torch_loader:
+        if args.do_eval:
+            trainer = pl.Trainer(check_val_every_n_epoch=1, gpus = args.gpus, num_sanity_val_steps=0, max_epochs = args.epochs, logger = logger) 
+            with DataLoader(make_reader('{}/train'.format(args.dataset_url), 
                                         #num_epochs=args.epochs,
                                         transform_spec=transform),
-                            batch_size=args.test_batch_size) as eval_dataset:
-                trainer.fit(model,train_dataset,eval_dataset)
-    else:
-        trainer = pl.Trainer(check_val_every_n_epoch=0,  gpus = args.gpus, num_sanity_val_steps=0, max_epochs = args.epochs, logger = logger)
-        with DataLoader(make_reader('{}/train'.format(args.dataset_url), 
-                                    #num_epochs=args.epochs,
-                                    transform_spec=transform),
-                        batch_size=args.batch_size) as train_dataset:
-                trainer.fit(model, train_dataset, DataLoader([["dummy"]]))
+                            batch_size=args.batch_size) as train_dataset:
+                with DataLoader(make_reader('{}/test'.format(args.dataset_url), 
+                                            #num_epochs=args.epochs,
+                                            transform_spec=transform),
+                                batch_size=args.test_batch_size) as eval_dataset:
+                    trainer.fit(model,train_dataset,eval_dataset)
+        else:
+            trainer = pl.Trainer(check_val_every_n_epoch=0,  gpus = args.gpus, num_sanity_val_steps=0, max_epochs = args.epochs, logger = logger)
+            with DataLoader(make_reader('{}/train'.format(args.dataset_url), 
+                                        #num_epochs=args.epochs,
+                                        transform_spec=transform),
+                            batch_size=args.batch_size) as train_dataset:
+                    trainer.fit(model, train_dataset, DataLoader([["dummy"]]))
+
+
+    else: #use pytorch dataloader
+        print ('Using Pytorch Dataloader')
+        if args.do_eval:
+            trainer = pl.Trainer(check_val_every_n_epoch=1, gpus = args.gpus, num_sanity_val_steps=0, max_epochs = args.epochs, logger = logger) 
+            train_dataset = d.DataLoader(TorchMNIST(root = '/projects/bdata/trelium/MNIST_torch', download=True, train=True), batch_size=args.batch_size) 
+            eval_dataset = d.DataLoader(TorchMNIST(root = '/projects/bdata/trelium/MNIST_torch', download=True, train=False),batch_size=args.test_batch_size)  
+            trainer.fit(model,train_dataset,eval_dataset)
+        else:
+            trainer = pl.Trainer(check_val_every_n_epoch=0,  gpus = args.gpus, num_sanity_val_steps=0, max_epochs = args.epochs, logger = logger)
+            train_dataset = d.DataLoader(TorchMNIST(root = '/projects/bdata/trelium/MNIST_torch', download=True, train=True), batch_size=args.batch_size) 
+
+            trainer.fit(model, train_dataset, DataLoader([["dummy"]]))
+
+
+
 
 if __name__ == '__main__':
     main()
